@@ -1,0 +1,8 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/Lang-Dent.t
+lib/Lang/Dent.pm
+lib/Lang/Dent/Parser.pm
+lib/Lang/Dent/Reparse.pm
