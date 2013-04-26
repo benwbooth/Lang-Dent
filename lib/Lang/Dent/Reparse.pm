@@ -24,8 +24,8 @@ state.
 =cut 
 
 sub fail {
-  my ($self, $input) = @_;
-  $self->{input} = $input if defined($input); 
+  my ($self, $state) = @_;
+  %$self = %$state if defined($state); 
   die \&fail;
 }
 
@@ -81,11 +81,12 @@ to its previous state.
 
 sub maybe {
   my ($self, $method) = @_;
-  my $input = ref($self->{input}) eq 'ARRAY'? [@{$self->{input}}] : $self->{input};
+  # make a shallow copy of the parser state
+  my $state = {%$self, input=>ref($self->{input}) eq 'ARRAY'? [@{$self->{input}}] : $self->{input}};
   my $result = eval { $self->produce($method); };
   if ($@) {
     $self->die($@) if $@ ne \&fail;
-    $self->fail($input);
+    $self->fail($state);
   }
   $result;
 }

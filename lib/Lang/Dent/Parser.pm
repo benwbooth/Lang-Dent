@@ -1,6 +1,6 @@
 package Lang::Dent::Parser;
 
-# TODO: parser, macro expander, code generator, self-hosting
+# TODO: macro expander, code generator, self-hosting
 # implementation, repl
 
 use Data::Dumper qw(Dumper);
@@ -8,7 +8,7 @@ use List::Util qw(min);
 
 use JSON;
 
-use base 'Lang::Dent::Reparse';
+use parent 'Lang::Dent::Reparse';
 
 sub new {
   my ($class, %options) = @_;
@@ -31,11 +31,21 @@ sub type { meta($_[0])->{type} }
 
 sub document {
   my ($self) = @_;
-  my $lists = [map {@$_} @{$self->many(indentedList(''))}];
+  my $lists = [map {@$_} @{$self->sepEndBy(indentedList(''), \&blanklines)}];
   my $comment = $self->option(\&comment);
   with_meta(
     [(map {@$_} @$lists), defined($comment)?$commment:()], 
     {type=>'Document', defined($comment)?(comment=>$comment):()});
+}
+
+sub blankline {
+  my ($self) = @_;
+  $self->produce(\&indent);
+  $self->match(qr/^\n/);
+}
+sub blanklines {
+  my ($self) = @_;
+  $self->many(\&blankline);
 }
 
 sub indent {
@@ -46,13 +56,8 @@ sub indent {
 sub comment {
   my ($self) = @_;
 
-  # try to parse literate comments or regular comments
   my $indent = $self->produce(\&indent);
-  my $comment = $self->{literate} && length($indent) == 0
-    ? $self->match(qr/^[^\n]*/) : $self->option(qr/^#[^\n]*/);
-  # try to parse a newline
-  my $eol = $self->option(qr/^\n/);
-
+  my $comment = $self->produce(qr/^#[^\n]*\n/);
   $self->fail if !defined($comment) && !defined($eol);
 
   my $comments = join('', grep {defined} ($comment,$eol));
@@ -88,18 +93,36 @@ sub indentedList {
     $self->{indent} = undef;
 
     my $tokenLine = $self->produce(\&tokenLine);
-    my $sublists = [ map {@$_} @{$self->many(sub {$_[0]->indentedList($indent)})} ];
+    # assume unindented lines terminate at eol for interactive mode
+    my $sublists = length($indent)>0? 
+      [ map {@$_} @{$self->many(sub {$_[0]->indentedList($indent)})} ] : [];
 
     [ @tokens == 1 && @$sublists == 0? 
         merge_meta($tokens[0],
           {defined($comments)?(comments=>$comments):()}) : 
-        process_listops(with_meta([@tokens, map {@$_} @$sublists], 
+        listOps(with_meta([@tokens, map {@$_} @$sublists], 
           {type=>'List', defined($comments)?(comments=>$comments):()}))
     ];
   };
 }
 
-sub comma {
+sub quotedListOp {
+  my ($list) = @_;
+  if (@$list && type($list->[0]) eq 'String' && meta($list->[0])->{bareword}) {
+    if (${$list->[0]} eq '`') {
+      $self->{quoted} = 1;
+      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>$self->{quoted}});
+    } 
+    elsif (${$list->[0]} eq '~') {
+      $self->{quoted} = undef;
+      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>$self->{quoted}});
+    }
+  }
+  $list;
+  return with_meta($list, {%{meta($list)}, quoted=>$self->{quoted}});
+}
+
+sub commaListOp {
   my ($list) = @_;
   my $newlist = with_meta([], meta($list));
   for my $element (@$list) {
@@ -119,7 +142,7 @@ sub comma {
   $newlist;
 }
 
-sub semicolon {
+sub semicolonListOp {
   my ($list) = @_;
   my @lists = (with_meta([], meta($list)));
   for my $element (@$list) {
@@ -133,13 +156,13 @@ sub semicolon {
   @lists;
 }
 
-sub colon {
+sub colonListOp {
   my ($list) = @_;
   my $newlist = with_meta([], meta($list));
   for my $i (0..$#$list) {
     my $element = $list->[$i];
     if (type($element) eq 'String' && $$element eq ':' && meta($element)->{bareword}) {
-      push @$newlist, colon(with_meta([@$list[$i+1..$#$list]], {type=>'List'}));
+      push @$newlist, colonListOp(with_meta([@$list[$i+1..$#$list]], {type=>'List'}));
     } 
     else {
       push @$newlist, $element; 
@@ -148,9 +171,9 @@ sub colon {
   $newlist;
 }
 
-sub process_listops {
+sub listOps {
   my ($list) = @_;
-  map {colon($_)} map {semicolon($_)} map {comma($_)} ($list);
+  map {quotedListOp($_)} map {colonListOp($_)} map {semicolonListOp($_)} map {commaListOp($_)} ($list);
 }
 
 sub linecomment {
@@ -176,7 +199,7 @@ sub token {
   $self->choice(
     \&reflist,
     \&collectingList,
-    infixList('List'),
+    infixList(list(qr/^\{/, qr/^\}/, 'List')),
     list(qr/^\(/, qr/^\)/, 'List'),
     list(qr/^\[/, qr/^\]/, 'QuotedList'),
     \&number,
@@ -185,6 +208,19 @@ sub token {
     neoteric(\&symbol),
     neoteric(\&bareWord),
   );
+}
+
+sub backtickQuote {
+  my ($parser) = @_;
+  sub {
+    my ($self) = @_;
+    $self->maybe(sub {
+      my ($self) = @_;
+      my $op = $self->option(qr/^[`~]/);
+      my $element = $self->produce($parser);
+      merge_meta($list, {backtickQuoted=>'true'});
+    }):
+  };
 }
 
 sub list {
@@ -261,10 +297,9 @@ sub infix {
 }
 
 sub infixList {
-  my ($type) = @_;
+  my ($list) = @_;
   sub {
     my ($self) = @_;
-    my $list = $self->produce(list(qr/^\{/, qr/^\}/, $type));
     return $list if @$list==0 || @$list == 2;
     return $list[0] if @$list == 1;
     die "Even number of elements in infix list" if @$list % 2 == 0;
@@ -294,11 +329,27 @@ sub neoteric {
 
 sub symbol {
   my ($self) = @_;
-  my $sigil = $self->match(qr/^[\$\@\%\&\*:]/);
-  my $name = $self->option(sub {$_[0]->choice(string('"'), string("'"), \&bareWord)});
-  defined($name)? 
-    with_meta($name, {type=>'Symbol', sigil=>$sigil}) :
-    with_meta($sigil, {type=>'String'});
+  $self->match(qr/^(?=~?[\$\@\%\&\*:])/);
+  my $unquote = $self->option(qr/^~/);
+  my $prefix = $self->choice(
+    # scalar dereferencing sigils
+    qr/^\$\$/,
+    qr/^\@\$/,
+    qr/^\&\$/,
+    qr/^\%\$/,
+    # normal sigils
+    qr/^[\$\@\%\&\*:]/,
+  );
+  my $label = $self->option(sub {$_[0]->choice(string('"'), string("'"), \&bareWord)});
+
+  my ($deref, $sigil, $name) = defined($label)? ($prefix=~/^(.)?(.)$/,$label) : 
+    $prefix eq '$$' && !defined($label)? (undef,'$','$') : 
+    (undef, undef, $label);
+
+  my $result = defined($sigil)?
+    with_meta($name, {type=>'Symbol', sigil=>$sigil, defined($unquote)?(quoted=>'false'):()}) :
+    with_meta(join('',grep {defined} ($unquote, $name)), {type=>'String'});
+  defined($deref)? with_meta([with_meta($deref,{type=>'Symbol'}), $result], {type=>'List'}) : $result;
 }
 
 sub bareWord {
