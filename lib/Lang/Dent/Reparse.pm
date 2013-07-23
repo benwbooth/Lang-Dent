@@ -64,7 +64,7 @@ sub start {
 }
 
 sub die {
-  my ($message) = @_;
+  my ($self, $message) = @_;
   die "$message"
     .(defined($self->{filename})?
       " in \"$self->{filename}\"":"")
