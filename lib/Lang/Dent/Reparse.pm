@@ -1,4 +1,6 @@
 package Lang::Dent::Reparse;
+use strict;
+use warnings;
 
 sub new {
   my ($class, $input) = @_;

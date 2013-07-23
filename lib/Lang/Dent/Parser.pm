@@ -1,4 +1,5 @@
 package Lang::Dent::Parser;
+use Lang::Dent::Meta qw(:all);
 
 # TODO: macro expander, code generator, self-hosting
 # implementation, repl
@@ -22,12 +23,6 @@ sub parse {
   $self->set_input($data=~/\n$/?$data:$data."\n");
   $self->start(\&document);
 }
-
-my $json = JSON->new->allow_nonref;
-sub meta { ref($_[0])? $json->decode(ref($_[0])) : {} }
-sub with_meta { $_[1]? bless($_[0], $json->encode($_[1])) : $_[0] }
-sub merge_meta { with_meta($_[0], {%{meta($_[0])}, %{$_[1]||{}}}) }
-sub type { meta($_[0])->{type} }
 
 sub document {
   my ($self) = @_;
@@ -55,14 +50,11 @@ sub indent {
 
 sub comment {
   my ($self) = @_;
-
   my $indent = $self->produce(\&indent);
-  my $comment = $self->produce(qr/^#[^\n]*\n/);
-  $self->fail if !defined($comment) && !defined($eol);
-
-  my $comments = join('', grep {defined} ($comment,$eol));
+  my $comment = $self->produce(qr/^#([^\n]*\n)/);
+  $self->fail if !defined($comment);
   $self->{indent} = undef;
-  $comments;
+  $comment;
 }
 
 sub pod {
@@ -89,7 +81,7 @@ sub indentedList {
     die("Inconsistent whitespace usage in indentation") 
       if substr($indent,0,$indent_length) ne substr($parent_indent,0,$indent_length);
     # dedent
-    $self->fail if $self->eof || length($indent) <= length($parent_indent);
+    $self->fail if length($indent) <= length($parent_indent);
     $self->{indent} = undef;
 
     my $tokenLine = $self->produce(\&tokenLine);
@@ -110,16 +102,13 @@ sub quotedListOp {
   my ($list) = @_;
   if (@$list && type($list->[0]) eq 'String' && meta($list->[0])->{bareword}) {
     if (${$list->[0]} eq '`') {
-      $self->{quoted} = 1;
-      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>$self->{quoted}});
+      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>'true'});
     } 
     elsif (${$list->[0]} eq '~') {
-      $self->{quoted} = undef;
-      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>$self->{quoted}});
+      return with_meta([@$list[1..$#$list]], {%{meta($list)}, quoted=>'false'});
     }
   }
   $list;
-  return with_meta($list, {%{meta($list)}, quoted=>$self->{quoted}});
 }
 
 sub commaListOp {
@@ -201,26 +190,13 @@ sub token {
     \&collectingList,
     infixList(list(qr/^\{/, qr/^\}/, 'List')),
     list(qr/^\(/, qr/^\)/, 'List'),
-    list(qr/^\[/, qr/^\]/, 'QuotedList'),
+    list(qr/^\[/, qr/^\]/, 'ArrayList'),
     \&number,
-    neoteric(string('"')),
+    neoteric(string('"',interpolate=>'true')),
     neoteric(string("'")),
     neoteric(\&symbol),
     neoteric(\&bareWord),
   );
-}
-
-sub backtickQuote {
-  my ($parser) = @_;
-  sub {
-    my ($self) = @_;
-    $self->maybe(sub {
-      my ($self) = @_;
-      my $op = $self->option(qr/^[`~]/);
-      my $element = $self->produce($parser);
-      merge_meta($list, {backtickQuoted=>'true'});
-    }):
-  };
 }
 
 sub list {
@@ -232,7 +208,6 @@ sub list {
     my $eol = $self->option(qr/^\n/);
     my $moreLines = defined($eol)? $self->many(sub {
       my ($self) = @_;
-      $self->fail if $self->eof;
       my $comments = $self->option(\&comments);
       my $tokenLine = $self->produce(\&tokenLine);
       $self->option(qr/^\n/);
@@ -248,7 +223,7 @@ sub reflist {
   my ($self) = @_;
   $self->match(qr/^(?=[\@\&\%]\[)/);
   my $sigil = $self->match(qr/^[\@\&\%]/);
-  my $list = $self->produce(list(qr/^\[/,qr/^\]/,'QuotedList'));
+  my $list = $self->produce(list(qr/^\[/,qr/^\]/,'ArrayList'));
   merge_meta($list, {
       type=>$sigil eq '@'? 'ArrayList' :
             $sigil eq '&'? 'CodeList' : 
@@ -269,24 +244,18 @@ sub collectingList {
   with_meta([defined($tokenLine)?@$tokenLine:(), @$lists], {%{meta($lists)}, type=>'List'});
 }
 
+sub indentedStringLine {
+  my ($self) = @_;
+  my $indent = $self->produce(\&indent);
+  my $line = $self->produce(qr/^~([^\n]*\n)/);
+  $self->fail if !defined($line);
+  $self->{indent} = undef;
+  $line;
+}
+
 sub indentedString {
   my ($self) = @_;
-  $self->match(qr/^<<<[ \t\r]*\n/);
-
-  my $parent_indent = $self->produce(\&indent);
-  my $string = join('', map {@$_} ($self->many(sub {
-    my ($self) = @_;
-    # parse indentation
-    my $indent = $self->produce(\&indent);
-    my $indent_length = min(length($parent_indent),length($indent));
-    die("Inconsistent whitespace usage in indentation") 
-      if substr($indent,0,$indent_length) ne substr($parent_indent,0,$indent_length);
-    # check if this is a blank line, those do not end the string.
-    my $eol = $self->option(qr/^\n/);
-    $self->fail if !defined($eol) && (length($indent) < length($parent_indent) || length($indent) == 0);
-    $self->{indent} = undef;
-    defined($eol)? join('',substr($indent,$indent_length), $eol) : $self->match(qr/^[^\n]*\n/);
-  })));
+  my $string = join('', @{$self->many1(\&indentedStringLine)});
   with_meta($string, {type=>'String'});
 }
 
@@ -312,10 +281,10 @@ sub neoteric {
   sub {
     my ($self) = @_; 
     my $result = $self->produce($parser);
-    my $list = $self->option($self->choice(
+    my $list = $self->option(sub {$_[0]->choice(
         list(qr/^\(/, qr/^\)/, 'List'),
         infixList('InfixList'),
-      ));
+      )});
     if ($list && type($list) eq 'List') {
       unshift @$list, $result;
       return $list;
@@ -340,7 +309,7 @@ sub symbol {
     # normal sigils
     qr/^[\$\@\%\&\*:]/,
   );
-  my $label = $self->option(sub {$_[0]->choice(string('"'), string("'"), \&bareWord)});
+  my $label = $self->option(sub {$_[0]->choice(string('"',interpolate=>'true'), string("'"), \&bareWord)});
 
   my ($deref, $sigil, $name) = defined($label)? ($prefix=~/^(.)?(.)$/,$label) : 
     $prefix eq '$$' && !defined($label)? (undef,'$','$') : 
@@ -359,14 +328,14 @@ sub bareWord {
 }
 
 sub string {
-  my ($delim) = @_;
+  my ($delim, %meta) = @_;
   sub {
     my ($self) = @_;
     $self->match(qr/^\Q$delim\E/);
     my $str = $self->match(qr/^(?:(?!\Q$delim\E).|\Q$delim\E\Q$delim\E)*/); 
     $self->match(qr/^\Q$delim\E/);
     $str =~ s/\Q$delim\E\Q$delim\E/\Q$delim\E/g;
-    with_meta($str, {type=>'String'});
+    with_meta($str, {type=>'String', %meta});
   };
 }
 
