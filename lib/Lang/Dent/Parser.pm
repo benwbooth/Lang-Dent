@@ -172,15 +172,10 @@ sub linecomment {
 
 sub tokenLine {
   my ($self) = @_;
-  $self->choice(
-    \&indentedString,
-    sub {
-      my ($self) = @_;
-      my $tokens = $self->sepEndBy1(\&token, qr/^[ \t\r]+/);
-      my $linecomment = $self->option(\&linecomment);
-      merge_meta($tokens->[-1], {linecomment=>$linecomment}) if defined $linecomment;
-      $tokens;
-    });
+  my $tokens = $self->sepEndBy1(\&token, qr/^[ \t\r]+/);
+  my $linecomment = $self->option(\&linecomment);
+  merge_meta($tokens->[-1], {linecomment=>$linecomment}) if defined $linecomment;
+  $tokens;
 }
 
 sub token {
@@ -192,7 +187,8 @@ sub token {
     list(qr/^\(/, qr/^\)/, 'List'),
     list(qr/^\[/, qr/^\]/, 'ArrayList'),
     \&number,
-    neoteric(string('"',interpolate=>'true')),
+    \&multilineString,
+    neoteric(string('"')),
     neoteric(string("'")),
     neoteric(\&symbol),
     neoteric(\&bareWord),
@@ -244,18 +240,18 @@ sub collectingList {
   with_meta([defined($tokenLine)?@$tokenLine:(), @$lists], {%{meta($lists)}, type=>'List'});
 }
 
-sub indentedStringLine {
+sub multilineStringLine {
   my ($self) = @_;
   my $indent = $self->produce(\&indent);
-  my $line = $self->produce(qr/^~([^\n]*\n)/);
+  my $line = $self->produce(qr/^\^([^\n]*\n)/);
   $self->fail if !defined($line);
   $self->{indent} = undef;
   $line;
 }
 
-sub indentedString {
+sub multilineString {
   my ($self) = @_;
-  my $string = join('', @{$self->many1(\&indentedStringLine)});
+  my $string = join('', @{$self->many1(\&multilineStringLine)});
   with_meta($string, {type=>'String'});
 }
 
@@ -281,16 +277,22 @@ sub neoteric {
   sub {
     my ($self) = @_; 
     my $result = $self->produce($parser);
-    my $list = $self->option(sub {$_[0]->choice(
+    my $next = $self->option(sub {$_[0]->choice(
         list(qr/^\(/, qr/^\)/, 'List'),
         infixList('InfixList'),
+        \&multilineString,
+        neoteric(string('"')),
+        neoteric(string("'")),
       )});
-    if ($list && type($list) eq 'List') {
-      unshift @$list, $result;
-      return $list;
+    if ($next && type($next) eq 'List') {
+      unshift @$next, $result;
+      return $next;
     }
-    if ($list && type($list) eq 'InfixList') {
-      return with_meta([$result, merge_meta($list, {type=>'List'})], {type=>'List'});
+    elsif ($next && type($next) eq 'InfixList') {
+      return with_meta([$result, merge_meta($next, {type=>'List'})], {type=>'List'});
+    }
+    elsif ($next) {
+      return with_meta([$result, $next], {type=>'List'});
     }
     $result;
   };
@@ -298,27 +300,11 @@ sub neoteric {
 
 sub symbol {
   my ($self) = @_;
-  $self->match(qr/^(?=~?[\$\@\%\&\*:])/);
-  my $unquote = $self->option(qr/^~/);
-  my $prefix = $self->choice(
-    # scalar dereferencing sigils
-    qr/^\$\$/,
-    qr/^\@\$/,
-    qr/^\&\$/,
-    qr/^\%\$/,
-    # normal sigils
-    qr/^[\$\@\%\&\*:]/,
-  );
-  my $label = $self->option(sub {$_[0]->choice(string('"',interpolate=>'true'), string("'"), \&bareWord)});
-
-  my ($deref, $sigil, $name) = defined($label)? ($prefix=~/^(.)?(.)$/,$label) : 
-    $prefix eq '$$' && !defined($label)? (undef,'$','$') : 
-    (undef, undef, $label);
-
-  my $result = defined($sigil)?
-    with_meta($name, {type=>'Symbol', sigil=>$sigil, defined($unquote)?(quoted=>'false'):()}) :
-    with_meta(join('',grep {defined} ($unquote, $name)), {type=>'String'});
-  defined($deref)? with_meta([with_meta($deref,{type=>'Symbol'}), $result], {type=>'List'}) : $result;
+  my $sigil = $self->match(qr/^~?(?:[:]|[\\\$\@\%\&\*]+)/);
+  my $unquote = $sigil =~ s/^~//;
+  my $label = $self->option(sub {$_[0]->choice(string('"'), string("'"), \&bareWord)});
+  my $name = $sigil.(defined($label)? $label : '');
+  my $result = with_meta($name, {type=>'Symbol', $unquote?(quoted=>'false'):()});
 }
 
 sub bareWord {
@@ -328,14 +314,14 @@ sub bareWord {
 }
 
 sub string {
-  my ($delim, %meta) = @_;
+  my ($delim) = @_;
   sub {
     my ($self) = @_;
     $self->match(qr/^\Q$delim\E/);
     my $str = $self->match(qr/^(?:(?!\Q$delim\E).|\Q$delim\E\Q$delim\E)*/); 
     $self->match(qr/^\Q$delim\E/);
     $str =~ s/\Q$delim\E\Q$delim\E/\Q$delim\E/g;
-    with_meta($str, {type=>'String', %meta});
+    with_meta($str, {type=>'String'});
   };
 }
 
